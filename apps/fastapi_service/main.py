@@ -1,96 +1,256 @@
-import os, zipfile, uuid
-from fastapi import FastAPI, UploadFile, File, Form
-from fastapi.responses import JSONResponse, FileResponse
-import pandas as pd
+# apps/fastapi_service/main.py
+from fastapi import FastAPI, UploadFile, File, Form, HTTPException
+from fastapi import BackgroundTasks
+from fastapi.responses import RedirectResponse, FileResponse, JSONResponse
+import os, io, uuid, zipfile, time
+from typing import List, Tuple, Dict
 
-# Imports absolutos (sin el punto) para evitar errores de relative import
-from inference import infer_image
-from pdf_report import build_pdf, export_csv, plot_barras
+import numpy as np
+import cv2
+from PIL import Image
 
-app = FastAPI(title='PreSeeds · Uniformidad API')
-
-# Carpeta de salida para resultados
-OUT_DIR = os.environ.get('OUT_DIR', 'outputs')
+# =========================
+# Configuración básica
+# =========================
+app = FastAPI(title="PreSeeds · Uniformidad API", version="0.2.0")
+OUT_DIR = os.getenv("OUT_DIR", "/app/outputs")
 os.makedirs(OUT_DIR, exist_ok=True)
 
-@app.post('/uniformidad/infer')
+
+# =========================
+# Utilidades de imagen
+# =========================
+def _read_rgb(image_bytes: bytes, max_side: int = 4000) -> np.ndarray:
+    """
+    Lee bytes a imagen RGB (uint8). Si es gigantesca, reduce manteniendo aspecto
+    para evitar OOM/timeouts en Render Free.
+    """
+    img = Image.open(io.BytesIO(image_bytes)).convert("RGB")
+    w, h = img.size
+    if max(w, h) > max_side:
+        img.thumbnail((max_side, max_side))  # mantiene aspecto
+    return np.array(img)  # RGB uint8
+
+
+def _clahe_rgb(rgb: np.ndarray) -> np.ndarray:
+    """Normaliza iluminación aplicando CLAHE sobre el canal L en LAB."""
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    l, a, b = cv2.split(lab)
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+    l2 = clahe.apply(l)
+    lab2 = cv2.merge([l2, a, b])
+    return cv2.cvtColor(lab2, cv2.COLOR_LAB2RGB)
+
+
+def _compute_indices(rgb: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
+    """Calcula ExG y VARI y retorna normalizados a [0,1]."""
+    rgb_f = rgb.astype(np.float32) / 255.0
+    R, G, B = rgb_f[..., 0], rgb_f[..., 1], rgb_f[..., 2]
+    exg = 2 * G - R - B
+    vari = (G - R) / (G + R - B + 1e-6)
+    exg_n = (exg - exg.min()) / (exg.max() - exg.min() + 1e-6)
+    vari_n = (vari - vari.min()) / (vari.max() - vari.min() + 1e-6)
+    return exg_n.astype(np.float32), vari_n.astype(np.float32)
+
+
+def _green_rules(rgb: np.ndarray) -> np.ndarray:
+    """
+    Máscara para píxeles verdes usando HSV y Lab.
+    - HSV: H ~35..95°, S >= 0.15, V >= 0.12
+    - Lab: a* negativo → verdoso
+    """
+    hsv = cv2.cvtColor(rgb, cv2.COLOR_RGB2HSV)
+    h = hsv[..., 0].astype(np.float32) * 2.0  # 0..360 aprox
+    s = hsv[..., 1].astype(np.float32) / 255.0
+    v = hsv[..., 2].astype(np.float32) / 255.0
+    mask_hsv = (h >= 35) & (h <= 95) & (s >= 0.15) & (v >= 0.12)
+
+    lab = cv2.cvtColor(rgb, cv2.COLOR_RGB2LAB)
+    a = lab[..., 1].astype(np.int16) - 128
+    mask_lab = (a < 0)
+
+    return (mask_hsv & mask_lab)
+
+
+def _local_percentile_threshold(score: np.ndarray, tile: int = 128, q: int = 65) -> np.ndarray:
+    """
+    Umbral local por baldosa: cada tile usa su propio percentil como threshold.
+    Evita que sombras o bandas arruinen un umbral global.
+    """
+    h, w = score.shape
+    mask = np.zeros_like(score, dtype=bool)
+    for y in range(0, h, tile):
+        for x in range(0, w, tile):
+            ys, xs = slice(y, min(y + tile, h)), slice(x, min(x + tile, w))
+            block = score[ys, xs]
+            t = np.percentile(block, q)
+            mask[ys, xs] = block >= t
+    return mask
+
+
+def _postprocess(mask: np.ndarray, min_area: int = 300) -> np.ndarray:
+    """
+    Limpieza morfológica:
+    - abrir/cerrar
+    - quitar componentes pequeñas
+    - rellenar huecos grandes
+    """
+    m = mask.astype(np.uint8) * 255
+    k = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (5, 5))
+    m = cv2.morphologyEx(m, cv2.MORPH_OPEN, k, iterations=1)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=1)
+
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(m, connectivity=8)
+    keep = np.zeros(num, dtype=bool)
+    for i in range(1, num):
+        if stats[i, cv2.CC_STAT_AREA] >= min_area:
+            keep[i] = True
+    out = np.isin(labels, np.where(keep)[0]).astype(np.uint8) * 255
+
+    inv = 255 - out
+    inv = cv2.morphologyEx(inv, cv2.MORPH_OPEN, k, iterations=1)
+    inv = cv2.morphologyEx(inv, cv2.MORPH_CLOSE, k, iterations=1)
+    out = 255 - inv
+
+    return (out > 127)
+
+
+def segment_cultivo(rgb: np.ndarray) -> Tuple[np.ndarray, Dict]:
+    """
+    Pipeline principal: CLAHE → ExG/VARI → threshold local → reglas verdes → postproceso.
+    Devuelve mask booleana (cultivo) y métrica de cobertura.
+    """
+    rgb2 = _clahe_rgb(rgb)
+    exg, vari = _compute_indices(rgb2)
+    score = 0.6 * exg + 0.4 * vari
+    mask_idx = _local_percentile_threshold(score, tile=128, q=65)
+    mask_green = _green_rules(rgb2)
+    mask = mask_idx & mask_green
+    mask = _postprocess(mask, min_area=300)
+    coverage = float(mask.mean())  # 0..1
+    return mask, {"coverage": coverage}
+
+
+def make_overlay(rgb: np.ndarray, mask: np.ndarray, alpha: float = 0.5) -> np.ndarray:
+    """Pinta cultivo en verde translucido sobre la imagen original."""
+    overlay = rgb.copy()
+    color = np.array([0, 255, 0], dtype=np.uint8)
+    overlay[mask] = (alpha * color + (1 - alpha) * overlay[mask]).astype(np.uint8)
+    return overlay
+
+
+def infer_image_bytes(image_bytes: bytes, out_dir: str) -> Dict:
+    """
+    Corre el pipeline sobre una imagen (bytes) y guarda:
+      - mask.png
+      - overlay.jpg
+    Retorna dict con run_id, paths y métricas.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+    run_id = uuid.uuid4().hex[:12]
+
+    rgb = _read_rgb(image_bytes, max_side=4000)
+    mask, metrics = segment_cultivo(rgb)
+    overlay = make_overlay(rgb, mask)
+
+    mask_u8 = (mask.astype(np.uint8) * 255)
+    mask_path = os.path.join(out_dir, f"{run_id}_mask.png")
+    over_path = os.path.join(out_dir, f"{run_id}_overlay.jpg")
+
+    cv2.imwrite(mask_path, mask_u8)
+    cv2.imwrite(over_path, cv2.cvtColor(overlay, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 92])
+
+    return {
+        "run_id": run_id,
+        "mask_path": mask_path,
+        "overlay_path": over_path,
+        "metrics": metrics,
+    }
+
+
+# =========================
+# Endpoints
+# =========================
+@app.get("/health")
+def health():
+    return {"ok": True}
+
+
+@app.get("/")
+def root():
+    # Redirige al swagger para evitar 404
+    return RedirectResponse(url="/docs")
+
+
+@app.post("/uniformidad/infer")
 async def uniformidad_infer(
-    images: list[UploadFile] = File(...),
-    asesor: str = Form(''), campo: str = Form(''), cultivo: str = Form(''),
-    lote: str = Form(''), localidad: str = Form(''), area_img_m2: float = Form(26.0), blocks: int = Form(10)
+    images: List[UploadFile] = File(..., description="1..N imágenes (JPG/PNG)"),
+    assessor: str = Form(""),
+    campo: str = Form(""),
+    cultivo: str = Form(""),
+    lote: str = Form(""),
+    localidad: str = Form(""),
+    area_img_m2: str = Form(""),
+    blocks: int = Form(10),
 ):
-    run_id = str(uuid.uuid4())[:8]
-    run_dir = os.path.join(OUT_DIR, f'run_{run_id}')
-    os.makedirs(run_dir, exist_ok=True)
+    """
+    Procesa N imágenes, guarda resultados y devuelve un ZIP con:
+    - img_XX_mask.png
+    - img_XX_overlay.jpg
+    """
+    if not images:
+        raise HTTPException(status_code=400, detail="Sube al menos una imagen")
 
-    all_rows = []
-    zippath = os.path.join(run_dir, 'resultados.zip')
+    # Procesamos todas y armamos el ZIP
+    run_id = None
+    tmp_files = []
+    zip_path = os.path.join(OUT_DIR, f"{uuid.uuid4().hex[:8]}.zip")
 
-    with zipfile.ZipFile(zippath, 'w', zipfile.ZIP_DEFLATED) as zf:
-        for idx, up in enumerate(images):
-            img_bytes = await up.read()
-            res = infer_image(img_bytes, blocks=blocks)
+    with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
+        for i, f in enumerate(images, start=1):
+            content = await f.read()
+            result = infer_image_bytes(content, OUT_DIR)
+            if run_id is None:
+                run_id = result["run_id"]
+                # renombrar el zip con run_id definitivo
+                zf.close()
+                new_zip = os.path.join(OUT_DIR, f"{run_id}.zip")
+                os.rename(zip_path, new_zip)
+                zip_path = new_zip
+                zf = zipfile.ZipFile(zip_path, "a", zipfile.ZIP_DEFLATED)
 
-            # CSV por imagen
-            csv_path = os.path.join(run_dir, f'stats_{idx+1}.csv')
-            export_csv(csv_path, res['blocks_stats'])
-            zf.write(csv_path, os.path.basename(csv_path))
+            # agregar archivos al ZIP
+            arc_mask = f"img_{i:02d}_mask.png"
+            arc_over = f"img_{i:02d}_overlay.jpg"
+            zf.write(result["mask_path"], arcname=arc_mask)
+            zf.write(result["overlay_path"], arcname=arc_over)
+            tmp_files += [result["mask_path"], result["overlay_path"]]
 
-            # Conteo de clases para el gráfico de barras
-            classes = pd.DataFrame(res['blocks_stats'])['clase'].value_counts().to_dict()
-            alta = classes.get('Alta', 0)
-            media = classes.get('Media', 0)
-            baja = classes.get('Baja', 0)
+        # (Opcional) incluir un pequeño README con metadatos
+        meta_txt = (
+            "PreSeeds · Uniformidad\n"
+            f"assessor={assessor}\n"
+            f"campo={campo}\n"
+            f"cultivo={cultivo}\n"
+            f"lote={lote}\n"
+            f"localidad={localidad}\n"
+            f"area_img_m2={area_img_m2}\n"
+            f"blocks={blocks}\n"
+            f"timestamp={time.strftime('%Y-%m-%d %H:%M:%S')}\n"
+        )
+        zf.writestr("metadata.txt", meta_txt)
 
-            # PDF por imagen
-            pdf_path = os.path.join(run_dir, f'reporte_{idx+1}.pdf')
-            meta = {
-                'asesor': asesor,
-                'campo': campo,
-                'cultivo': cultivo,
-                'lote': lote,
-                'localidad': localidad,
-                'pct_cobertura': res['pct_global'],
-                'alta': alta,
-                'media': media,
-                'baja': baja
-            }
-            orig_path = os.path.join(run_dir, f'orig_{idx+1}.jpg')
-            with open(orig_path, 'wb') as f:
-                f.write(img_bytes)
-            barras_png = plot_barras({'Baja': baja, 'Media': media, 'Alta': alta})
-            build_pdf(pdf_path, 'Informe de Uniformidad de Siembra', meta, orig_path, res['processed_png'], barras_png)
-            zf.write(pdf_path, os.path.basename(pdf_path))
+    # (Opcional) borrar temporales para ahorrar espacio
+    # for p in tmp_files:
+    #     try: os.remove(p)
+    #     except: pass
 
-            # Guardar imagen procesada PNG
-            proc_path = os.path.join(run_dir, f'procesada_{idx+1}.png')
-            with open(proc_path, 'wb') as f:
-                f.write(res['processed_png'])
-            zf.write(proc_path, os.path.basename(proc_path))
-
-            all_rows.append({
-                'imagen': up.filename,
-                'pct_cobertura': res['pct_global'],
-                'alta': alta,
-                'media': media,
-                'baja': baja
-            })
-
-        # CSV global con resumen de todas las imágenes
-        global_csv = os.path.join(run_dir, 'resumen_global.csv')
-        pd.DataFrame(all_rows).to_csv(global_csv, index=False)
-        zf.write(global_csv, os.path.basename(global_csv))
-
-    return JSONResponse({
-        'run_id': run_id,
-        'zip_path': zippath,
-        'message': f'Procesamiento OK. {len(images)} imagen(es).'
-    })
+    return {"run_id": run_id, "zip_path": zip_path, "message": "OK"}
 
 
-@app.get('/download/{run_id}')
-def download_zip(run_id: str):
-    zippath = os.path.join(OUT_DIR, f'run_{run_id}', 'resultados.zip')
-    if not os.path.exists(zippath):
-        return JSONResponse({'error': 'No encontrado'}, status_code=404)
-    return FileResponse(zippath, media_type='application/zip', filename=f'preseeds_uniformidad_{run_id}.zip')
+@app.get("/download/{run_id}")
+def download(run_id: str):
+    zip_path = os.path.join(OUT_DIR, f"{run_id}.zip")
+    if not os.path.exists(zip_path):
+        raise HTTPException(status_code=404, detail="No encontrado o aún procesando")
+    return FileResponse(zip_path, media_type="application/zip", filename=f"{run_id}.zip")
