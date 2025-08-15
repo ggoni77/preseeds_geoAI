@@ -1,0 +1,7 @@
+.venv/
+apps/*/.venv/
+__pycache__/
+*.zip
+outputs/
+.DS_Store
+.streamlit/
