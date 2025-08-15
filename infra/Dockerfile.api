@@ -1,8 +1,23 @@
 FROM python:3.11-slim
+
+# Libs del sistema que necesita OpenCV (headless) y fuentes
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    libglib2.0-0 libgl1 libsm6 libxext6 libxrender1 \
+ && rm -rf /var/lib/apt/lists/*
+
 WORKDIR /app
+
+# Instalar deps Python
 COPY apps/fastapi_service/requirements.txt /app/requirements.txt
 RUN pip install --no-cache-dir -r requirements.txt
+
+# Copiar código
 COPY apps/fastapi_service /app
-ENV OUT_DIR=/app/outputs
+
+ENV OUT_DIR=/app/outputs \
+    PYTHONUNBUFFERED=1
+
+# Importante: Render exige escuchar en $PORT
+# Usamos ${PORT:-8000} para fallback local
 EXPOSE 8000
-CMD ["uvicorn","main:app","--host","0.0.0.0","--port","8000"]
+CMD ["sh", "-c", "uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000}"]
